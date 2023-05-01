@@ -49,7 +49,7 @@ async def paxos_server(request, phase, proposal_seq, path):
             return response([accepted_seq, accepted_value])
 
         if 'accept' == phase:
-            if accepted_value['uuid'] == pickle.load(request.body)['uuid']:
+            if accepted_value['uuid'] == pickle.loads(request.body)['uuid']:
                 return response('OK')
 
         if 'learn' == phase:
@@ -198,6 +198,7 @@ async def put(request, path, version):
 
     path = os.path.join(path, str(int(version)))
     tags['blobs'] = blobs
+    tags['length'] = len(request.body)
     tags['status'] = await paxos_client(path, tags)
     return sanic.response.json(tags)
 
@@ -236,11 +237,10 @@ async def get(request, path):
     localpath = os.path.join('kv', reader, path.strip('/'))
 
     res = await rpc('version//{}'.format(localpath))
-    if QUORUM < len(res):
+    if QUORUM > len(res):
         raise sanic.exceptions.BadRequest()
 
     ver = max(res.values())
-
     localpath = os.path.join(localpath, str(ver))
 
     promised_seq = DEFAULT_SEQ
@@ -249,10 +249,12 @@ async def get(request, path):
             promised_seq, accepted_seq, accepted_value = json.load(fd)
 
     if LEARNED_SEQ != promised_seq:
-        await put(request, path, ver)
+        await paxos_client(localpath, b'')
 
     with open(localpath) as fd:
         promised_seq, accepted_seq, accepted_value = json.load(fd)
+        if LEARNED_SEQ != promised_seq:
+            raise sanic.exceptions.BadRequest()
 
     for guid in accepted_value['blobs']:
         localpath = os.path.join(os.path.dirname(localpath), guid)
@@ -292,7 +294,7 @@ if '__main__' == __name__:
         ssl_ctx.load_cert_chain('server.pem', 'server.key')
         ssl_ctx.verify_mode = ssl.CERT_REQUIRED
 
-    signal.alarm(random.randint(1, 5))
+    signal.alarm(random.randint(1, 3600))
 
     for i, srv in enumerate(sorted(SERVERS)):
         logging.critical('cluster node({}) : {}'.format(i+1, srv))
