@@ -23,11 +23,14 @@ DEFAULT_SEQ = '00000000-000000'
 LEARNED_SEQ = '99999999-999999'
 
 
-def blob_dump(path, blob):
+def dump(path, content):
+    if type(content) is not bytes:
+        content = json.dumps(content, indent=4, sort_keys=True).encode()
+
     tmpfile = '{}-{}.tmp'.format(path, uuid.uuid4())
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(tmpfile, 'wb') as fd:
-        fd.write(blob)
+        fd.write(content)
     os.replace(tmpfile, path)
 
 
@@ -57,16 +60,12 @@ async def paxos_server(request, phase, proposal_seq, path):
 
     # Paxos standard - phase 1
     if 'promise' == phase and proposal_seq > promised_seq:
-        blob_dump(path, json.dumps(
-            [proposal_seq, accepted_seq, accepted_value],
-            indent=4, sort_keys=True).encode())
+        dump(path, [proposal_seq, accepted_seq, accepted_value])
         return response([accepted_seq, accepted_value])
 
     # Paxos standard - phase 2
     if 'accept' == phase and proposal_seq == promised_seq:
-        blob_dump(path, json.dumps(
-            [proposal_seq, proposal_seq, pickle.loads(request.body)],
-            indent=4, sort_keys=True).encode())
+        dump(path, [proposal_seq, proposal_seq, pickle.loads(request.body)])
         return response('OK')
 
     # Paxos protocol is already complete. This is a custom learn step.
@@ -75,9 +74,7 @@ async def paxos_server(request, phase, proposal_seq, path):
         # Set promise_seq = accepted_seq = '99999999-999999'
         # This is the largest possible value for seq and would ensure
         # that any subsequent paxos rounds get rejected.
-        blob_dump(path, json.dumps(
-            [LEARNED_SEQ, LEARNED_SEQ, accepted_value],
-            indent=4, sort_keys=True).encode())
+        dump(path, [LEARNED_SEQ, LEARNED_SEQ, accepted_value])
         return response('OK')
 
     raise sanic.exceptions.BadRequest()
@@ -155,7 +152,7 @@ async def get_put_uuid(request, action, path):
         raise sanic.exceptions.Unauthorized()
 
     if 'put' == action:
-        blob_dump(path, pickle.loads(request.body))
+        dump(path, pickle.loads(request.body))
         return response('OK')
 
     if 'get' == action:
@@ -178,13 +175,13 @@ async def put(request, path, version):
     if 0 != int(version):
         prevpath = os.path.join(path, str(int(version) - 1))
         if not os.path.isfile(prevpath):
-            tags['status'] = 'SEQ_OUT_OF_ORDER'
+            tags['status'] = 'INVALID_SEQ'
             return sanic.response.json(tags, status=400)
 
         with open(prevpath) as fd:
             promised_seq, accepted_seq, accepted_value = json.load(fd)
             if LEARNED_SEQ != promised_seq:
-                tags['status'] = 'SEQ_ALREADY_IN_PROGRESS'
+                tags['status'] = 'INCOMPLETE_PREV_SEQ'
                 return sanic.response.json(tags, status=400)
 
     blobs = list()
@@ -266,7 +263,7 @@ async def get(request, path):
             srv = random.choice(list(SERVERS))
             res = await rpc('uuid/get/{}'.format(localpath), servers=[srv])
             if res:
-                blob_dump(localpath, res[srv])
+                dump(localpath, res[srv])
                 break
 
     blobs = list()
