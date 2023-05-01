@@ -37,8 +37,10 @@ class Client:
 
             try:
                 r = self.session.put('{}//{}'.format(srv, key), data=blob)
-                if 200 == r.status_code:
-                    return r.json()
+                if r.status_code in (200, 400):
+                    result = r.json()
+                    result['status_code'] = r.status_code
+                    return result
             except Exception:
                 pass
 
@@ -49,7 +51,7 @@ class Client:
 
             try:
                 r = self.session.get('{}//{}'.format(srv, key))
-                if 200 == r.status_code:
+                if r.status_code in (200, 400):
                     return extract_response(r)
             except Exception:
                 pass

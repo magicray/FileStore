@@ -31,20 +31,14 @@ def blob_dump(path, blob):
     os.replace(tmpfile, path)
 
 
-def paxos_dump(path, promised_seq, accepted_seq, accepted_value):
-    blob_dump(path, json.dumps(
-        [promised_seq, accepted_seq, accepted_value],
-        indent=4, sort_keys=True).encode())
-
-
 # PAXOS Acceptor and Learner
 @APP.post('/paxos/<phase:str>/<proposal_seq:str>/<path:path>')
 async def paxos_server(request, phase, proposal_seq, path):
     if 'http' != request.scheme and get_peer(request) not in SERVERS:
         raise sanic.exceptions.Unauthorized()
 
-    accepted_value = dict()
     promised_seq = accepted_seq = DEFAULT_SEQ
+    accepted_value = dict()
 
     if os.path.isfile(path):
         with open(path) as fd:
@@ -54,18 +48,25 @@ async def paxos_server(request, phase, proposal_seq, path):
         if 'promise' == phase:
             return response([accepted_seq, accepted_value])
 
-        elif phase in ('accept', 'learn'):
+        if 'accept' == phase:
+            if accepted_value['uuid'] == pickle.load(request.body)['uuid']:
+                return response('OK')
+
+        if 'learn' == phase:
             return response('OK')
 
     # Paxos standard - phase 1
     if 'promise' == phase and proposal_seq > promised_seq:
-        paxos_dump(path, proposal_seq, accepted_seq, accepted_value)
+        blob_dump(path, json.dumps(
+            [proposal_seq, accepted_seq, accepted_value],
+            indent=4, sort_keys=True).encode())
         return response([accepted_seq, accepted_value])
 
     # Paxos standard - phase 2
     if 'accept' == phase and proposal_seq == promised_seq:
-        paxos_dump(path, proposal_seq, proposal_seq,
-                   pickle.loads(request.body))
+        blob_dump(path, json.dumps(
+            [proposal_seq, proposal_seq, pickle.loads(request.body)],
+            indent=4, sort_keys=True).encode())
         return response('OK')
 
     # Paxos protocol is already complete. This is a custom learn step.
@@ -73,8 +74,10 @@ async def paxos_server(request, phase, proposal_seq, path):
         # This paxos round completed. Mark this value as final.
         # Set promise_seq = accepted_seq = '99999999-999999'
         # This is the largest possible value for seq and would ensure
-        # tha any subsequent paxos rounds get rejected.
-        paxos_dump(path, LEARNED_SEQ, LEARNED_SEQ, accepted_value)
+        # that any subsequent paxos rounds get rejected.
+        blob_dump(path, json.dumps(
+            [LEARNED_SEQ, LEARNED_SEQ, accepted_value],
+            indent=4, sort_keys=True).encode())
         return response('OK')
 
     raise sanic.exceptions.BadRequest()
@@ -98,8 +101,7 @@ async def paxos_client(path, value):
         return 'NO_ACCEPT_QUORUM'
 
     # No need to check the result of this.
-    # PAXOS round has already completed.  If a node doesn't learn
-    # the value, another paxos round would be run at the read time.
+    # PAXOS round has already completed.
     await rpc(url.format('learn'))
 
     return 'CONFLICT' if value is not proposal[1] else 'OK'
@@ -148,7 +150,7 @@ async def rpc(url, obj=None, servers=None):
 
 
 @APP.post('/uuid/<action:str>/<path:path>')
-async def put_uuid(request, action, path):
+async def get_put_uuid(request, action, path):
     if 'http' != request.scheme and get_peer(request) not in SERVERS:
         raise sanic.exceptions.Unauthorized()
 
@@ -166,21 +168,36 @@ async def put(request, path, version):
     writer = get_peer(request) if 'http' != request.scheme else ''
     writer = hashlib.sha256(writer.encode()).hexdigest()
 
+    tags = dict(host='{}:{}'.format(HOST, PORT),
+                uuid=str(uuid.uuid4()),
+                datetime=time.strftime('%Y-%m-%d %H:%M:%S'),
+                path=path, version=int(version))
+
     path = os.path.join('kv', writer, path.strip('/'))
+
+    if 0 != int(version):
+        prevpath = os.path.join(path, str(int(version) - 1))
+        if not os.path.isfile(prevpath):
+            tags['status'] = 'SEQ_OUT_OF_ORDER'
+            return sanic.response.json(tags, status=400)
+
+        with open(prevpath) as fd:
+            promised_seq, accepted_seq, accepted_value = json.load(fd)
+            if LEARNED_SEQ != promised_seq:
+                tags['status'] = 'SEQ_ALREADY_IN_PROGRESS'
+                return sanic.response.json(tags, status=400)
 
     blobs = list()
     if request.body:
         # Write the content blobs
-        blobs = [str(uuid.uuid4())]
+        blobs = ['{}-{}'.format(version, uuid.uuid4())]
         res = await rpc('uuid/put/{}/{}'.format(path, blobs[0]), request.body)
         if QUORUM > len(res):
-            return 'NO_UUID_WRITE_QUORUM'
-
-    tags = dict(host='{}:{}'.format(HOST, PORT),
-                datetime=time.strftime('%Y-%m-%d %H:%M:%S'),
-                path=path, version=int(version), blobs=blobs)
+            tags['status'] = 'NO_UUID_WRITE_QUORUM'
+            return sanic.response.json(tags, status=400)
 
     path = os.path.join(path, str(int(version)))
+    tags['blobs'] = blobs
     tags['status'] = await paxos_client(path, tags)
     return sanic.response.json(tags)
 
@@ -193,13 +210,23 @@ async def version(request, path):
     path = path.strip('/')
     files = [int(f) for f in os.listdir(path) if f.isdigit()]
 
+    # Find the highest version for which some value is accepted
+    # Paxos round for this might not have completed already and Caller
+    # must first complete this round before proceeding to the next version
     for version in sorted(files, reverse=True):
-        path = os.path.join(path, str(version))
-        with open(path) as fd:
+        localpath = os.path.join(path, str(version))
+        with open(localpath) as fd:
             promised_seq, accepted_seq, accepted_value = json.load(fd)
 
         if accepted_seq != DEFAULT_SEQ:
-            return response(version)
+            break
+
+    # Remove older paxos and blob files
+    for f in os.listdir(path):
+        if int(f.split('-')[0]) < int(version):
+            os.remove(os.path.join(path, f))
+
+    return response(version)
 
 
 @APP.get('/<path:path>')
@@ -209,6 +236,9 @@ async def get(request, path):
     localpath = os.path.join('kv', reader, path.strip('/'))
 
     res = await rpc('version//{}'.format(localpath))
+    if QUORUM < len(res):
+        raise sanic.exceptions.BadRequest()
+
     ver = max(res.values())
 
     localpath = os.path.join(localpath, str(ver))
