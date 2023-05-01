@@ -1,0 +1,9 @@
+#!/bin/bash
+
+while true; do
+    python3 -mfilestore.server $1 \
+        localhost:8001 localhost:8002 localhost:8003 \
+        localhost:8004 localhost:8005
+
+    sleep 1
+done

@@ -1,0 +1,32 @@
+#!/bin/bash
+SERIAL=$(date +%Y%m%d%H%M%S)
+
+function generate_ca {
+    CAKEY=CA/$1.key
+    CAPEM=CA/$1.pem
+
+    mkdir -p CA && [ ! -f $CAKEY ] && [ ! -f $CAPEM ] && openssl req -x509 \
+        -newkey rsa:2048 -nodes -sha256 -days 1000 -set_serial $SERIAL     \
+        -subj "/CN=$1" -keyout $CAKEY -out $CAPEM
+}
+
+[ -z $1 ] || {
+    YEAR=$(date +%Y)
+    generate_ca $1.$YEAR
+    YEAR=$(($YEAR-1))
+    generate_ca $1.$YEAR
+}
+
+cat CA/*.pem > ca.pem
+for CERT in $(ls CA/*.pem); do
+    openssl x509 -in $CERT -text -noout | grep 'Subject: CN'
+done
+
+
+[ -z $2 ] || {
+    openssl genrsa -out $2.key 2048
+    openssl req -new -key $2.key -out $2.csr -subj "/CN=${*:2}"
+    openssl x509 -req -in $2.csr -CA CA/$1.$YEAR.pem -CAkey CA/$1.$YEAR.key \
+        -set_serial $SERIAL -days 42 -sha256 -out $2.pem
+    openssl x509 -in $2.pem -text -noout
+}
